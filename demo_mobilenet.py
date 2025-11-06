@@ -39,6 +39,8 @@ import platform
 sys.path.append(str(Path(__file__).parent))
 
 from src.models.mobilenet_classifier import MobileNetDriverClassifier
+from src.models.object_detector import TFLiteObjectDetector
+from src.logic.distraction_reasoning import DistractionReasoning, AlertLevel
 from src.utils.speed_monitor import SpeedMonitor
 
 # Try to import audio library
@@ -223,7 +225,7 @@ class DistractionDetector:
             print(f"⚠️  Could not play sound: {e}")
             print("🔔 ALERT!")
 
-    def draw_overlay(self, frame, result, alert_active=False, speed_status=None):
+    def draw_overlay(self, frame, result, alert_active=False, speed_status=None, detected_objects=None, assessment=None):
         """
         Draw overlay on frame.
 
@@ -232,6 +234,8 @@ class DistractionDetector:
             result: Prediction result (None if detection inactive)
             alert_active: Whether alert is currently triggered
             speed_status: Speed monitor status dict
+            detected_objects: List of detected objects from TFLite
+            assessment: DistractionAssessment from reasoning engine
 
         Returns:
             Frame with overlay
@@ -405,6 +409,64 @@ class DistractionDetector:
             bar_label = f"Alert Progress: {distracted_ratio*100:.0f}%"
             cv2.putText(frame, bar_label, (bar_x, bar_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        # Draw detected objects (bounding boxes)
+        if detected_objects:
+            for obj in detected_objects:
+                x, y, w_box, h_box = obj.bbox
+
+                # Color based on distraction level
+                if obj.class_name == 'cell phone':
+                    box_color = (0, 0, 255)  # Red
+                elif obj.class_name in ['cup', 'bottle', 'wine glass']:
+                    box_color = (0, 165, 255)  # Orange
+                else:
+                    box_color = (0, 255, 0)  # Green
+
+                # Draw bounding box
+                cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), box_color, 2)
+
+                # Draw label with confidence
+                label = f"{obj.class_name}: {obj.confidence:.2f}"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame, (x, y - label_size[1] - 10),
+                            (x + label_size[0], y), box_color, -1)
+                cv2.putText(frame, label, (x, y - 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Draw distraction triggers (right side panel)
+        if assessment and assessment.triggers:
+            panel_x = w - 350
+            panel_y = 170
+            panel_width = 330
+            panel_height = 30 + (len(assessment.triggers) * 25)
+
+            # Semi-transparent panel
+            overlay_panel = frame.copy()
+            cv2.rectangle(overlay_panel, (panel_x, panel_y),
+                         (panel_x + panel_width, panel_y + panel_height),
+                         (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay_panel, 0.6, frame, 0.4, 0)
+
+            # Title
+            cv2.putText(frame, "Distraction Triggers:", (panel_x + 10, panel_y + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # List triggers
+            for i, trigger in enumerate(assessment.triggers):
+                y_pos = panel_y + 45 + (i * 25)
+
+                # Color based on alert level
+                if trigger.alert_level == AlertLevel.HIGH:
+                    trig_color = (0, 0, 255)  # Red
+                elif trigger.alert_level == AlertLevel.MEDIUM:
+                    trig_color = (0, 165, 255)  # Orange
+                else:
+                    trig_color = (0, 255, 0)  # Green
+
+                trigger_text = f"• {trigger.name.replace('_', ' ').title()}: {trigger.confidence:.1%}"
+                cv2.putText(frame, trigger_text, (panel_x + 15, y_pos),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, trig_color, 1)
+
         # Draw controls
         controls = "Controls: Q=Quit  S=Screenshot  R=Record"
         cv2.putText(
@@ -438,6 +500,29 @@ def main():
 
     # Initialize detector
     detector = DistractionDetector(model_path, device="auto")
+
+    # Initialize object detector
+    print("\nInitializing TFLite object detector...")
+    tflite_model = project_root / "models" / "tflite" / "detect.tflite"
+    labelmap = project_root / "models" / "tflite" / "labelmap.txt"
+
+    object_detector = TFLiteObjectDetector(
+        model_path=str(tflite_model),
+        labelmap_path=str(labelmap),
+        confidence_threshold=0.6
+    )
+    print("✓ Object detector initialized!")
+
+    # Initialize reasoning engine
+    print("\nInitializing multi-modal reasoning engine...")
+    reasoning_engine = DistractionReasoning(
+        object_confidence_threshold=0.6,
+        distraction_confidence_threshold=0.7,
+        enable_object_detection=True,
+        frame_skip=3  # Run object detection every 3rd frame for performance
+    )
+    print("✓ Reasoning engine initialized!")
+    print("  Multi-component detection: Phone + Eating/Drinking + Posture")
 
     # Initialize speed monitor
     print("\nInitializing speed monitor...")
@@ -486,21 +571,60 @@ def main():
 
             # Only run detection if speed conditions are met
             if speed_monitor.should_activate_detection():
-                # Run detection
+                # Run distraction classification
                 result = detector.predict(frame)
 
+                # Run object detection
+                detected_objects = object_detector.detect(frame)
+
+                # Multi-modal reasoning
+                assessment = reasoning_engine.analyze(
+                    frame=frame,
+                    distraction_probability=result['probabilities'][1],  # Probability of "Distracted"
+                    detected_objects=detected_objects
+                )
+
+                # Use assessment for alert checking (override with multi-modal result)
+                if assessment.is_distracted and assessment.overall_confidence >= detector.distraction_threshold:
+                    # Add to history for sustained distraction check
+                    detector.distraction_history.append(1)
+                else:
+                    detector.distraction_history.append(0)
+
                 # Check for sustained distraction alert
-                alert_triggered = detector.check_sustained_distraction(result)
-                if alert_triggered:
-                    detector.play_alert_sound()
-                    print("🚨 ALERT: Sustained distraction detected!")
+                if len(detector.distraction_history) >= int(detector.sustained_duration * 30):
+                    distracted_frames = sum(detector.distraction_history)
+                    distracted_ratio = distracted_frames / len(detector.distraction_history)
+
+                    if distracted_ratio >= 0.8:
+                        current_time = time.time()
+                        if current_time - detector.last_alert_time >= detector.alert_cooldown:
+                            detector.last_alert_time = current_time
+                            alert_triggered = True
+                            detector.play_alert_sound()
+                            print(f"🚨 ALERT: {assessment.explanation}")
+                        else:
+                            alert_triggered = False
+                    else:
+                        alert_triggered = False
+                else:
+                    alert_triggered = False
             else:
-                # Detection inactive - create placeholder result
+                # Detection inactive - create placeholder results
                 result = None
                 alert_triggered = False
+                detected_objects = []
+                assessment = None
 
-            # Draw overlay
-            frame = detector.draw_overlay(frame, result, alert_active=alert_triggered, speed_status=speed_status)
+            # Draw overlay with detected objects and assessment
+            frame = detector.draw_overlay(
+                frame,
+                result,
+                alert_active=alert_triggered,
+                speed_status=speed_status,
+                detected_objects=detected_objects if speed_monitor.should_activate_detection() else [],
+                assessment=assessment if speed_monitor.should_activate_detection() else None
+            )
 
             # Calculate FPS
             fps_frame_count += 1

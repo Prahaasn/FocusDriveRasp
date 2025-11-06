@@ -4,6 +4,7 @@ torchvision>=0.15.0
 transformers>=4.57.0
 accelerate>=0.20.0
 datasets>=2.14.0
+tensorflow>=2.20.0  # For TFLite object detection
 
 # Vision & Image Processing
 opencv-python>=4.8.0
