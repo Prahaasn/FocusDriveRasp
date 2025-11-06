@@ -1,0 +1,5 @@
+{
+  "num_classes": 2,
+  "freeze_backbone": false,
+  "architecture": "MobileNetV3-Large"
+}

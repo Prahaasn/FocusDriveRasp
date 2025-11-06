@@ -40,12 +40,16 @@ env/
 
 # Model checkpoints and large files
 models/checkpoints/
-models/mobilenet_checkpoints/
 models/final/
-*.pt
 *.pth
 *.ckpt
 *.h5
+
+# Allow essential trained models (tracked by Git LFS)
+!models/mobilenet_checkpoints/
+!models/mobilenet_checkpoints/*.pt
+!models/mobilenet_checkpoints/*.json
+!models/mobilenet_checkpoints/best_model_pretrained/
 
 # Deployment artifacts
 deployment/quantized/
