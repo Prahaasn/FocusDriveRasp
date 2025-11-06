@@ -64,7 +64,6 @@ class SpeedMonitor:
         self.sim_target_speed = 0.0
         self.sim_mode = 'stopped'  # stopped, accelerating, cruising, decelerating
         self.sim_mode_start_time = time.time()
-        self.sim_mode_duration = 0.0
 
         # Driving pattern configuration
         self.sim_patterns = {
@@ -73,6 +72,9 @@ class SpeedMonitor:
             'cruising': {'duration': (10, 30), 'next': 'decelerating'},
             'decelerating': {'duration': (3, 8), 'next': 'stopped'}
         }
+
+        # Set initial mode duration
+        self.sim_mode_duration = random.uniform(*self.sim_patterns['stopped']['duration'])
 
     def _update_simulated_speed(self) -> float:
         """
@@ -89,18 +91,18 @@ class SpeedMonitor:
             pattern = self.sim_patterns[self.sim_mode]
             next_mode = pattern['next']
 
-            # Set target speed for new mode
-            if next_mode == 'accelerating':
-                self.sim_target_speed = random.uniform(*pattern['target_speed'])
-            elif next_mode == 'stopped' or next_mode == 'decelerating':
-                self.sim_target_speed = 0.0
-            # cruising keeps current speed
-
             # Switch to new mode
             self.sim_mode = next_mode
             self.sim_mode_start_time = current_time
             pattern = self.sim_patterns[self.sim_mode]
             self.sim_mode_duration = random.uniform(*pattern['duration'])
+
+            # Set target speed for new mode
+            if self.sim_mode == 'accelerating':
+                self.sim_target_speed = random.uniform(*pattern['target_speed'])
+            elif self.sim_mode == 'stopped' or self.sim_mode == 'decelerating':
+                self.sim_target_speed = 0.0
+            # cruising keeps current speed
 
         # Smoothly transition to target speed
         speed_diff = self.sim_target_speed - self.sim_current_speed
