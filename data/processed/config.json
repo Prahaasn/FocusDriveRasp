@@ -1,0 +1,45 @@
+{
+  "class_mapping": {
+    "c0": "safe driving",
+    "c1": "texting - right",
+    "c2": "talking on the phone - right",
+    "c3": "texting - left",
+    "c4": "talking on the phone - left",
+    "c5": "operating the radio",
+    "c6": "drinking",
+    "c7": "reaching behind",
+    "c8": "hair and makeup",
+    "c9": "talking to passenger"
+  },
+  "focusdrive_mapping": {
+    "c0": 0,
+    "c1": 1,
+    "c2": 1,
+    "c3": 1,
+    "c4": 1,
+    "c5": 1,
+    "c6": 1,
+    "c7": 1,
+    "c8": 1,
+    "c9": 1
+  },
+  "class_names": {
+    "0": "Attentive",
+    "1": "Distracted"
+  },
+  "metadata": {
+    "total_images": 22424,
+    "train_images": 15696,
+    "val_images": 3364,
+    "test_images": 3364,
+    "class_weights": {
+      "0": 4.502581755593804,
+      "1": 0.5624596860890131
+    },
+    "splits": {
+      "train": 0.7,
+      "val": 0.15,
+      "test": 0.15
+    }
+  }
+}
