@@ -12,6 +12,11 @@ import time
 import random
 from collections import deque
 from typing import Optional, Literal
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class SpeedMonitor:
@@ -24,7 +29,7 @@ class SpeedMonitor:
 
     def __init__(
         self,
-        method: Literal['simulated', 'gps', 'obd'] = 'simulated',
+        method: Literal['simulated', 'gps', 'obd', 'accelerometer'] = 'simulated',
         speed_threshold: float = 15.0,
         activation_duration: float = 10.0,
         history_size: int = 300  # 10 seconds at 30 FPS
@@ -33,7 +38,7 @@ class SpeedMonitor:
         Initialize speed monitor.
 
         Args:
-            method: Speed data source ('simulated', 'gps', 'obd')
+            method: Speed data source ('simulated', 'gps', 'obd', 'accelerometer')
             speed_threshold: Minimum speed (mph) to activate detection
             activation_duration: Time (seconds) above threshold before activating
             history_size: Number of speed readings to track
@@ -54,6 +59,43 @@ class SpeedMonitor:
         # Simulated speed generator
         if method == 'simulated':
             self._init_simulator()
+
+        # Accelerometer setup
+        if method == 'accelerometer':
+            try:
+                from src.utils.mpu6050_driver import MPU6050Sensor
+                from src.utils.accel_speed_estimator import AccelerometerSpeedEstimator
+
+                logger.info("Initializing MPU6050 accelerometer...")
+                self.mpu6050 = MPU6050Sensor(bus_number=1, address=0x68)
+
+                if not self.mpu6050.initialize():
+                    raise RuntimeError("Failed to initialize MPU6050")
+
+                logger.info("MPU6050 initialized successfully!")
+                logger.info("Calibrating MPU6050... Keep vehicle stationary!")
+
+                calibration = self.mpu6050.calibrate(samples=1000)
+                logger.info(f"Calibration complete: {calibration}")
+
+                # Initialize speed estimator
+                self.accel_estimator = AccelerometerSpeedEstimator(
+                    sensor=self.mpu6050,
+                    stationary_threshold=0.05,
+                    stationary_duration=0.5,
+                    forward_axis=0  # X-axis as forward (adjust if needed)
+                )
+                self.accel_last_update = time.time()
+
+                logger.info("Accelerometer speed monitoring ready!")
+
+            except ImportError as e:
+                raise ImportError(
+                    f"Missing dependencies for accelerometer: {e}. "
+                    "Install with: pip install smbus2"
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to setup accelerometer: {e}")
 
         # Last update time
         self.last_update_time = time.time()
@@ -128,6 +170,39 @@ class SpeedMonitor:
 
         return self.sim_current_speed
 
+    def _get_accelerometer_speed(self) -> float:
+        """
+        Get current vehicle speed from MPU6050 accelerometer.
+
+        Returns:
+            Current speed in mph
+
+        Raises:
+            RuntimeError: If accelerometer not initialized
+        """
+        if not hasattr(self, 'accel_estimator'):
+            raise RuntimeError("Accelerometer not initialized")
+
+        try:
+            # Calculate dt since last update
+            current_time = time.time()
+            dt = current_time - self.accel_last_update
+            self.accel_last_update = current_time
+
+            # Update speed estimate
+            result = self.accel_estimator.update(dt)
+
+            # Return speed in mph
+            return result['speed_mph']
+
+        except OSError as e:
+            # I2C communication error - return last known speed
+            logger.error(f"MPU6050 communication failed: {e}")
+            return self.speed_history[-1] if self.speed_history else 0.0
+        except Exception as e:
+            logger.error(f"Accelerometer speed estimation error: {e}")
+            return self.speed_history[-1] if self.speed_history else 0.0
+
     def get_current_speed(self) -> float:
         """
         Get current vehicle speed.
@@ -137,6 +212,8 @@ class SpeedMonitor:
         """
         if self.method == 'simulated':
             return self._update_simulated_speed()
+        elif self.method == 'accelerometer':
+            return self._get_accelerometer_speed()
         elif self.method == 'gps':
             # Placeholder for GPS implementation
             # TODO: Integrate gpsd-py3 library
@@ -234,6 +311,19 @@ class SpeedMonitor:
         self.time_below_threshold = 0.0
         if self.method == 'simulated':
             self._init_simulator()
+        elif self.method == 'accelerometer':
+            if hasattr(self, 'accel_estimator'):
+                self.accel_estimator.reset()
+
+    def cleanup(self):
+        """
+        Cleanup resources when shutting down.
+
+        Call this method before exiting to properly close I2C connections.
+        """
+        if hasattr(self, 'mpu6050'):
+            logger.info("Closing MPU6050 I2C connection...")
+            self.mpu6050.close()
 
 
 # Example usage and testing

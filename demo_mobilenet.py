@@ -30,30 +30,12 @@ import numpy as np
 from pathlib import Path
 import sys
 import time
-from datetime import datetime
-import torchvision.transforms as T
-from collections import deque
-import platform
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent))
 
 from src.models.mobilenet_classifier import MobileNetDriverClassifier
 from src.models.object_detector import TFLiteObjectDetector
-from src.logic.distraction_reasoning import DistractionReasoning, AlertLevel
-from src.utils.speed_monitor import SpeedMonitor
-
-# Try to import audio library
-try:
-    if platform.system() == 'Darwin':  # macOS
-        import subprocess
-        AUDIO_AVAILABLE = True
-    else:
-        from playsound import playsound
-        AUDIO_AVAILABLE = True
-except ImportError:
-    AUDIO_AVAILABLE = False
-    print("⚠️  Audio library not available. Install with: pip install playsound")
 
 
 class DistractionDetector:
@@ -87,16 +69,28 @@ class DistractionDetector:
         self.model = MobileNetDriverClassifier.load_pretrained(model_path, device=str(self.device))
         self.model.eval()
 
-        # Define transforms (same as training)
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        # Apply dynamic quantization for ARM CPU (2-4x speedup!)
+        print("Applying dynamic quantization for ARM CPU...")
+        self.model = torch.quantization.quantize_dynamic(
+            self.model,
+            {torch.nn.Linear, torch.nn.Conv2d},
+            dtype=torch.qint8
+        )
+        print("✓ Quantization complete!")
+
+        # Apply TorchScript JIT compilation (15-30% additional speedup)
+        print("Compiling model with TorchScript JIT...")
+        example_input = torch.randn(1, 3, 224, 224, device=self.device)
+        self.model = torch.jit.trace(self.model, example_input)
+        self.model = torch.jit.optimize_for_inference(self.model)
+        print("✓ JIT compilation complete!")
+
+        # Pre-computed normalization values (ImageNet)
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+        # Pre-allocate input tensor (reuse memory)
+        self.input_tensor = torch.zeros(1, 3, 224, 224, dtype=torch.float32, device=self.device)
 
         # Statistics
         self.frame_count = 0
@@ -105,50 +99,49 @@ class DistractionDetector:
         self.fps = 0
         self.inference_time = 0
 
-        # Alert system
-        self.distraction_history = deque(maxlen=90)  # 3 seconds at 30 FPS
-        self.alert_triggered = False
-        self.last_alert_time = 0
-        self.alert_cooldown = 5.0  # seconds between alerts
+        # Simplified alert system
+        self.distraction_counter = 0
+        self.alert_threshold = 45  # 1.5 seconds at 30 FPS
         self.distraction_threshold = 0.70  # 70% confidence
-        self.sustained_duration = 3.0  # 3 seconds
 
-        print("✓ Detector initialized!")
-        print(f"  Alert settings: {self.sustained_duration}s sustained distraction at {self.distraction_threshold*100:.0f}% confidence")
+        print("✓ Detector initialized (optimized for Pi 5)!")
 
-    def preprocess_frame(self, frame):
+    def preprocess_frame(self, frame_rgb):
         """
-        Preprocess webcam frame.
+        Optimized preprocessing using cv2/NumPy (no PIL, no allocations).
 
         Args:
-            frame: OpenCV frame (BGR)
+            frame_rgb: OpenCV frame in RGB format
 
         Returns:
             Preprocessed tensor [1, 3, 224, 224]
         """
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Resize with cv2 (faster than PIL)
+        resized = cv2.resize(frame_rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
 
-        # Apply transforms
-        tensor = self.transform(rgb_frame)
+        # Convert to float and normalize (NumPy vectorized operation)
+        normalized = (resized.astype(np.float32) / 255.0 - self.mean) / self.std
 
-        # Add batch dimension
-        tensor = tensor.unsqueeze(0)
+        # Copy to pre-allocated tensor (reuse memory, no allocation)
+        # Convert HWC -> CHW and copy to device
+        self.input_tensor.copy_(
+            torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0)
+        )
 
-        return tensor
+        return self.input_tensor
 
-    def predict(self, frame):
+    def predict(self, frame_rgb):
         """
         Run inference on frame.
 
         Args:
-            frame: OpenCV frame (BGR)
+            frame_rgb: OpenCV frame in RGB format
 
         Returns:
             Dictionary with prediction, confidence, and class name
         """
-        # Preprocess
-        tensor = self.preprocess_frame(frame).to(self.device)
+        # Preprocess (already on device, no .to() needed)
+        tensor = self.preprocess_frame(frame_rgb)
 
         # Inference
         start_time = time.time()
@@ -169,315 +162,65 @@ class DistractionDetector:
             'probabilities': probabilities
         }
 
-    def check_sustained_distraction(self, result):
-        """
-        Check if driver has been distracted for sustained period.
-
-        Args:
-            result: Current prediction result
-
-        Returns:
-            True if alert should be triggered
-        """
-        current_time = time.time()
-
-        # Add to history (1 if distracted above threshold, 0 otherwise)
-        is_distracted = (result['class_name'] == 'Distracted' and
-                        result['confidence'] >= self.distraction_threshold)
-        self.distraction_history.append(1 if is_distracted else 0)
-
-        # Need enough frames for sustained duration
-        if len(self.distraction_history) < int(self.sustained_duration * 30):
-            return False
-
-        # Check if cooldown period has passed
-        if current_time - self.last_alert_time < self.alert_cooldown:
-            return False
-
-        # Calculate percentage of recent frames that are distracted
-        distracted_frames = sum(self.distraction_history)
-        total_frames = len(self.distraction_history)
-        distracted_ratio = distracted_frames / total_frames
-
-        # Trigger if >= 80% of recent frames show distraction
-        if distracted_ratio >= 0.8:
-            self.last_alert_time = current_time
-            return True
-
-        return False
-
-    def play_alert_sound(self):
-        """Play buzzer alert sound."""
-        if not AUDIO_AVAILABLE:
-            print("🔔 ALERT! (audio not available)")
-            return
-
-        try:
-            if platform.system() == 'Darwin':  # macOS
-                # Use afplay with system beep sound
-                subprocess.Popen(['afplay', '/System/Library/Sounds/Funk.aiff'],
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-            else:
-                # Use system beep on other platforms
-                print('\a')  # Terminal bell
-        except Exception as e:
-            print(f"⚠️  Could not play sound: {e}")
-            print("🔔 ALERT!")
 
     def draw_overlay(self, frame, result, alert_active=False, speed_status=None, detected_objects=None, assessment=None):
         """
-        Draw overlay on frame.
+        Minimal optimized overlay for Pi 5 (40 lines vs 255!).
 
         Args:
-            frame: OpenCV frame
-            result: Prediction result (None if detection inactive)
-            alert_active: Whether alert is currently triggered
-            speed_status: Speed monitor status dict
-            detected_objects: List of detected objects from TFLite
-            assessment: DistractionAssessment from reasoning engine
+            frame: OpenCV frame (BGR)
+            result: Prediction result
+            alert_active: Whether alert is active
+            detected_objects: List of detected objects
 
         Returns:
-            Frame with overlay
+            Frame with minimal overlay
         """
         h, w = frame.shape[:2]
 
-        # If detection is inactive (speed too low), show gray overlay
-        if result is None:
-            color = (128, 128, 128)  # Gray
-            status = "DETECTION INACTIVE"
-            self.frame_count += 1
-        # Determine color based on prediction and alert
-        elif alert_active:
-            color = (0, 0, 255)  # Red - flashing alert
-            status = "⚠️ ALERT! DISTRACTED! ⚠️"
-            self.frame_count += 1
-        elif result['class_name'] == 'Attentive':
-            color = (0, 255, 0)  # Green
-            status = "ATTENTIVE"
+        # Update statistics
+        self.frame_count += 1
+        if result['class_name'] == 'Attentive':
             self.attentive_count += 1
-            self.frame_count += 1
         else:
-            color = (0, 165, 255)  # Orange
-            status = "DISTRACTED!"
             self.distracted_count += 1
-            self.frame_count += 1
 
-        # Draw semi-transparent overlay
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 150), color, -1)
-        frame = cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
-
-        # Draw status text
-        cv2.putText(
-            frame,
-            status,
-            (20, 60),
-            cv2.FONT_HERSHEY_DUPLEX,
-            2.0,
-            (255, 255, 255),
-            3
-        )
-
-        # Draw confidence (only if detection is active)
-        if result is not None:
-            confidence_text = f"Confidence: {result['confidence']*100:.1f}%"
-            cv2.putText(
-                frame,
-                confidence_text,
-                (20, 110),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2
-            )
-
-        # Draw speed information (if available)
-        if speed_status is not None:
-            speed = speed_status['speed']
-            is_active = speed_status['is_active']
-
-            # Speed display
-            speed_text = f"Speed: {speed:.1f} mph"
-            speed_color = (0, 255, 0) if speed >= 15.0 else (100, 100, 100)
-            cv2.putText(
-                frame,
-                speed_text,
-                (w - 250, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                speed_color,
-                2
-            )
-
-            # Activation status
-            if is_active:
-                status_text = "✓ ACTIVE"
-                status_color = (0, 255, 0)
-            else:
-                seconds_until = speed_status['seconds_until_active']
-                if speed >= 15.0:
-                    status_text = f"Activating in {seconds_until:.1f}s"
-                    status_color = (0, 165, 255)
-                else:
-                    status_text = "Speed too low"
-                    status_color = (100, 100, 100)
-
-            cv2.putText(
-                frame,
-                status_text,
-                (w - 250, 70),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                status_color,
-                2
-            )
-
-        # Draw probabilities (only if detection is active)
-        if result is not None:
-            prob_attentive = result['probabilities'][0] * 100
-            prob_distracted = result['probabilities'][1] * 100
-            prob_text = f"Attentive: {prob_attentive:.1f}%  |  Distracted: {prob_distracted:.1f}%"
-            cv2.putText(
-                frame,
-                prob_text,
-                (20, h - 140),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2
-            )
-
-        # Draw FPS and inference time
-        fps_text = f"FPS: {self.fps:.1f}  |  Inference: {self.inference_time:.1f}ms"
-        cv2.putText(
-            frame,
-            fps_text,
-            (20, h - 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
-        )
-
-        # Draw statistics
-        distraction_rate = (self.distracted_count / max(self.frame_count, 1)) * 100
-        stats_text = f"Frames: {self.frame_count}  |  Distraction Rate: {distraction_rate:.1f}%"
-        cv2.putText(
-            frame,
-            stats_text,
-            (20, h - 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
-        )
-
-        # Draw alert indicator if active
+        # Determine status and color
         if alert_active:
-            alert_text = "🔔 BUZZER ALERT ACTIVE!"
-            cv2.putText(
-                frame,
-                alert_text,
-                (w - 400, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 0, 255),
-                2
-            )
+            color = (0, 0, 255)  # Red for alert
+            status = "ALERT! DISTRACTED!"
+        elif result['class_name'] == 'Distracted':
+            color = (0, 165, 255)  # Orange for distracted
+            status = "DISTRACTED"
+        else:
+            color = (0, 255, 0)  # Green for attentive
+            status = "ATTENTIVE"
 
-        # Draw sustained distraction progress bar
-        if len(self.distraction_history) > 0:
-            distracted_ratio = sum(self.distraction_history) / len(self.distraction_history)
-            bar_width = 300
-            bar_height = 20
-            bar_x = w - bar_width - 20
-            bar_y = h - 40
+        # Draw colored border (3px thickness)
+        cv2.rectangle(frame, (0, 0), (w-1, h-1), color, 3)
 
-            # Background
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (100, 100, 100), -1)
+        # Draw status text (top-left, bold)
+        cv2.putText(frame, status, (10, 40),
+                    cv2.FONT_HERSHEY_BOLD, 1.2, color, 2)
 
-            # Filled portion
-            fill_width = int(bar_width * distracted_ratio)
-            bar_color = (0, 0, 255) if distracted_ratio >= 0.8 else (0, 165, 255)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), bar_color, -1)
+        # Draw confidence (below status)
+        conf_text = f"{result['confidence']*100:.0f}%"
+        cv2.putText(frame, conf_text, (10, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            # Border
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
+        # Draw FPS (top-right)
+        fps_text = f"{self.fps:.0f} FPS"
+        cv2.putText(frame, fps_text, (w-120, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            # Label
-            bar_label = f"Alert Progress: {distracted_ratio*100:.0f}%"
-            cv2.putText(frame, bar_label, (bar_x, bar_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # Draw detected objects (bounding boxes)
+        # Draw object bounding boxes (only phones for clarity)
         if detected_objects:
             for obj in detected_objects:
-                x, y, w_box, h_box = obj.bbox
-
-                # Color based on distraction level
                 if obj.class_name == 'cell phone':
-                    box_color = (0, 0, 255)  # Red
-                elif obj.class_name in ['cup', 'bottle', 'wine glass']:
-                    box_color = (0, 165, 255)  # Orange
-                else:
-                    box_color = (0, 255, 0)  # Green
-
-                # Draw bounding box
-                cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), box_color, 2)
-
-                # Draw label with confidence
-                label = f"{obj.class_name}: {obj.confidence:.2f}"
-                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (x, y - label_size[1] - 10),
-                            (x + label_size[0], y), box_color, -1)
-                cv2.putText(frame, label, (x, y - 5),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # Draw distraction triggers (right side panel)
-        if assessment and assessment.triggers:
-            panel_x = w - 350
-            panel_y = 170
-            panel_width = 330
-            panel_height = 30 + (len(assessment.triggers) * 25)
-
-            # Semi-transparent panel
-            overlay_panel = frame.copy()
-            cv2.rectangle(overlay_panel, (panel_x, panel_y),
-                         (panel_x + panel_width, panel_y + panel_height),
-                         (0, 0, 0), -1)
-            frame = cv2.addWeighted(overlay_panel, 0.6, frame, 0.4, 0)
-
-            # Title
-            cv2.putText(frame, "Distraction Triggers:", (panel_x + 10, panel_y + 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # List triggers
-            for i, trigger in enumerate(assessment.triggers):
-                y_pos = panel_y + 45 + (i * 25)
-
-                # Color based on alert level
-                if trigger.alert_level == AlertLevel.HIGH:
-                    trig_color = (0, 0, 255)  # Red
-                elif trigger.alert_level == AlertLevel.MEDIUM:
-                    trig_color = (0, 165, 255)  # Orange
-                else:
-                    trig_color = (0, 255, 0)  # Green
-
-                trigger_text = f"• {trigger.name.replace('_', ' ').title()}: {trigger.confidence:.1%}"
-                cv2.putText(frame, trigger_text, (panel_x + 15, y_pos),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, trig_color, 1)
-
-        # Draw controls
-        controls = "Controls: Q=Quit  S=Screenshot  R=Record"
-        cv2.putText(
-            frame,
-            controls,
-            (20, h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 200, 200),
-            1
-        )
+                    x, y, bw, bh = obj.bbox
+                    cv2.rectangle(frame, (x, y), (x+bw, y+bh), (0, 0, 255), 2)
+                    cv2.putText(frame, 'PHONE', (x, y-5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         return frame
 
@@ -498,8 +241,8 @@ def main():
         print("  python train_mobilenet.py --epochs 20 --batch-size 32")
         sys.exit(1)
 
-    # Initialize detector
-    detector = DistractionDetector(model_path, device="auto")
+    # Initialize detector (Force CPU on Raspberry Pi 5)
+    detector = DistractionDetector(model_path, device="cpu")
 
     # Initialize object detector
     print("\nInitializing TFLite object detector...")
@@ -513,117 +256,97 @@ def main():
     )
     print("✓ Object detector initialized!")
 
-    # Initialize reasoning engine
-    print("\nInitializing multi-modal reasoning engine...")
-    reasoning_engine = DistractionReasoning(
-        object_confidence_threshold=0.6,
-        distraction_confidence_threshold=0.7,
-        enable_object_detection=True,
-        frame_skip=3  # Run object detection every 3rd frame for performance
-    )
-    print("✓ Reasoning engine initialized!")
-    print("  Multi-component detection: Phone + Eating/Drinking + Posture")
+    # Open camera (Try picamera2 for Raspberry Pi Camera, fallback to OpenCV)
+    print("\nOpening camera...")
+    using_picamera = False
 
-    # Initialize speed monitor
-    print("\nInitializing speed monitor...")
-    speed_monitor = SpeedMonitor(
-        method='simulated',
-        speed_threshold=15.0,
-        activation_duration=10.0
-    )
-    print("✓ Speed monitor initialized!")
-    print(f"  Activation: Speed > {speed_monitor.speed_threshold} mph for > {speed_monitor.activation_duration}s")
+    try:
+        from picamera2 import Picamera2
+        print("Attempting to use Picamera2 (Raspberry Pi Camera)...")
+        cap = Picamera2()
+        config = cap.create_preview_configuration(
+            main={"size": (640, 480), "format": "RGB888"},
+            buffer_count=2,  # Double buffering for smoother capture
+        )
+        # Lock to 30 FPS for consistent timing
+        cap.set_controls({"FrameDurationLimits": (33333, 33333)})
+        cap.configure(config)
+        cap.start()
+        using_picamera = True
+        print("✓ Picamera2 initialized (Raspberry Pi Camera Module)")
+    except (ImportError, Exception) as e:
+        print(f"Picamera2 not available ({type(e).__name__}), using OpenCV...")
+        cap = cv2.VideoCapture(0)
 
-    # Open webcam
-    print("\nOpening webcam...")
-    cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("❌ Error: Could not open camera")
+            sys.exit(1)
 
-    if not cap.isOpened():
-        print("❌ Error: Could not open webcam")
-        sys.exit(1)
-
-    # Set resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    print("✓ Webcam opened!")
+        # Set resolution (Optimized for Raspberry Pi 5)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)  # Request 30 FPS
+        print("✓ OpenCV camera opened!")
     print("\nStarting detection...")
-    print("Press 'q' to quit, 's' to save screenshot, 'r' to record")
-
-    # Recording state
-    is_recording = False
-    video_writer = None
+    print("Press 'q' to quit")
 
     # FPS calculation
     fps_start_time = time.time()
     fps_frame_count = 0
 
+    # Frame skipping for object detection (Raspberry Pi 5 optimization)
+    frame_count = 0
+    obj_detect_interval = 5  # Run object detection every 5th frame (optimized for 30 FPS)
+    detected_objects = []  # Cache last detection result
+
     try:
         while True:
-            # Read frame
-            ret, frame = cap.read()
-            if not ret:
+            # Read frame and convert to RGB (SINGLE conversion)
+            if using_picamera:
+                frame_rgb = cap.capture_array()  # Already RGB
+                ret = True
+            else:
+                ret, frame_bgr = cap.read()
+                if ret:
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            if not ret or frame_rgb is None:
                 print("❌ Error: Failed to read frame")
                 break
 
-            # Update speed monitor
-            speed_status = speed_monitor.update()
+            # Run distraction classification with RGB frame
+            result = detector.predict(frame_rgb)
 
-            # Only run detection if speed conditions are met
-            if speed_monitor.should_activate_detection():
-                # Run distraction classification
-                result = detector.predict(frame)
+            # Run object detection with RGB frame (with frame skipping)
+            if frame_count % obj_detect_interval == 0:
+                detected_objects = object_detector.detect(frame_rgb)
+            frame_count += 1
 
-                # Run object detection
-                detected_objects = object_detector.detect(frame)
+            # Simple direct distraction logic (no complex reasoning engine)
+            is_distracted = (
+                result['class'] == 'Distracted' or
+                any(obj.class_name == 'cell phone' for obj in detected_objects)
+            )
 
-                # Multi-modal reasoning
-                assessment = reasoning_engine.analyze(
-                    frame=frame,
-                    distraction_probability=result['probabilities'][1],  # Probability of "Distracted"
-                    detected_objects=detected_objects
-                )
-
-                # Use assessment for alert checking (override with multi-modal result)
-                if assessment.is_distracted and assessment.overall_confidence >= detector.distraction_threshold:
-                    # Add to history for sustained distraction check
-                    detector.distraction_history.append(1)
-                else:
-                    detector.distraction_history.append(0)
-
-                # Check for sustained distraction alert
-                if len(detector.distraction_history) >= int(detector.sustained_duration * 30):
-                    distracted_frames = sum(detector.distraction_history)
-                    distracted_ratio = distracted_frames / len(detector.distraction_history)
-
-                    if distracted_ratio >= 0.8:
-                        current_time = time.time()
-                        if current_time - detector.last_alert_time >= detector.alert_cooldown:
-                            detector.last_alert_time = current_time
-                            alert_triggered = True
-                            detector.play_alert_sound()
-                            print(f"🚨 ALERT: {assessment.explanation}")
-                        else:
-                            alert_triggered = False
-                    else:
-                        alert_triggered = False
-                else:
-                    alert_triggered = False
+            # Simplified alert tracking with counter
+            if is_distracted:
+                detector.distraction_counter += 1
+                alert_active = (detector.distraction_counter >= detector.alert_threshold)
             else:
-                # Detection inactive - create placeholder results
-                result = None
-                alert_triggered = False
-                detected_objects = []
-                assessment = None
+                detector.distraction_counter = 0
+                alert_active = False
 
-            # Draw overlay with detected objects and assessment
-            frame = detector.draw_overlay(
-                frame,
+            # Convert RGB back to BGR for display
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            # Draw overlay (temporarily keep old signature, will optimize later)
+            frame_display = detector.draw_overlay(
+                frame_bgr,
                 result,
-                alert_active=alert_triggered,
-                speed_status=speed_status,
-                detected_objects=detected_objects if speed_monitor.should_activate_detection() else [],
-                assessment=assessment if speed_monitor.should_activate_detection() else None
+                alert_active=alert_active,
+                speed_status=None,
+                detected_objects=detected_objects,
+                assessment=None
             )
 
             # Calculate FPS
@@ -634,53 +357,13 @@ def main():
                 fps_start_time = time.time()
                 fps_frame_count = 0
 
-            # Write frame if recording
-            if is_recording and video_writer is not None:
-                video_writer.write(frame)
-
             # Show frame
-            cv2.imshow("FocusDrive - Distraction Detection", frame)
+            cv2.imshow("FocusDrive", frame_display)
 
-            # Handle keys
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('q'):
+            # Check for quit key only
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("\nQuitting...")
                 break
-
-            elif key == ord('s'):
-                # Save screenshot
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                screenshot_path = project_root / f"screenshot_{timestamp}.png"
-                cv2.imwrite(str(screenshot_path), frame)
-                print(f"✓ Screenshot saved: {screenshot_path}")
-
-            elif key == ord('r'):
-                # Toggle recording
-                if not is_recording:
-                    # Start recording
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    video_path = project_root / f"recording_{timestamp}.mp4"
-
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    fps = 30
-                    frame_size = (frame.shape[1], frame.shape[0])
-                    video_writer = cv2.VideoWriter(
-                        str(video_path),
-                        fourcc,
-                        fps,
-                        frame_size
-                    )
-
-                    is_recording = True
-                    print(f"🔴 Recording started: {video_path}")
-                else:
-                    # Stop recording
-                    is_recording = False
-                    if video_writer is not None:
-                        video_writer.release()
-                        video_writer = None
-                    print("⏹️  Recording stopped")
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
@@ -688,9 +371,13 @@ def main():
     finally:
         # Cleanup
         print("\nCleaning up...")
-        if video_writer is not None:
-            video_writer.release()
-        cap.release()
+
+        # Release camera properly based on type
+        if using_picamera:
+            cap.stop()
+        else:
+            cap.release()
+
         cv2.destroyAllWindows()
 
         # Print final statistics
