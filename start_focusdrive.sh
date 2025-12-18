@@ -34,20 +34,13 @@ fi
 
 echo ""
 echo "=========================================="
-echo "  Starting BLE GATT Server"
+echo "  Starting FocusDrive System"
 echo "=========================================="
-echo "Device Name: FocusDrive"
-echo "Service UUID: 9a1f0000-0000-1000-8000-00805f9b34fb"
-echo ""
-echo "To test on your iPhone:"
-echo "  1. Open nRF Connect app"
-echo "  2. Scan for devices"
-echo "  3. Connect to 'FocusDrive'"
-echo "  4. Enable notifications"
-echo ""
-echo "Press Ctrl+C to stop"
+echo "  • AI Driver Distraction Detection"
+echo "  • BLE Broadcasting to iPhone"
+echo "  • Real-time Camera Feed"
 echo "=========================================="
 echo ""
 
-# Run the BLE server
-python3 ble_server_standalone.py
+# Run the integrated system
+python3 run_focusdrive.py
